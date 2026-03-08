@@ -1,3 +1,29 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+//! OAuth2 authentication implementation for MCP server
+//!
+//! This module provides OAuth2 authentication capabilities including:
+//! - Client registration and validation
+//! - Authorization code flow
+//! - Token management and validation
+//! - Session management for auth flows
+//! - Middleware for request authentication
+
 use std::{collections::HashMap, sync::Arc};
 
 use askama::Template;
@@ -5,7 +31,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Form, Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
 };
@@ -21,18 +47,24 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-// Type alias for OAuth2 standard token response
+/// Type alias for OAuth2 standard token response
+/// Type alias for OAuth2 standard token response
 pub type AuthToken = StandardTokenResponse<EmptyExtraTokenFields, oauth2::basic::BasicTokenType>;
 
-// A easy way to manage MCP OAuth Store for managing tokens and sessions
+/// Centralized OAuth store for managing clients, sessions, and tokens
+/// Provides thread-safe access to OAuth-related data structures
 #[derive(Clone, Debug)]
 pub struct McpOAuthStore {
+    /// Registered OAuth clients with their configurations
     pub clients: Arc<RwLock<HashMap<String, OAuthClientConfig>>>,
+    /// Active authorization sessions indexed by session ID
     pub auth_sessions: Arc<RwLock<HashMap<String, AuthSession>>>,
+    /// Valid access tokens indexed by token string
     pub access_tokens: Arc<RwLock<HashMap<String, McpAccessToken>>>,
 }
 
 impl McpOAuthStore {
+    /// Create a new OAuth store with a default client configuration
     pub fn new() -> Self {
         let mut clients = HashMap::new();
         clients.insert(
@@ -52,6 +84,8 @@ impl McpOAuthStore {
         }
     }
 
+    /// Validate client credentials and redirect URI
+    /// Returns Some(client_config) if valid, None otherwise
     pub async fn validate_client(
         &self,
         client_id: &str,
@@ -59,13 +93,19 @@ impl McpOAuthStore {
     ) -> Option<OAuthClientConfig> {
         let clients = self.clients.read().await;
         if let Some(client) = clients.get(client_id) {
-            if client.redirect_uri.contains(&redirect_uri.to_string()) {
+            info!("client.redirect_uri: {}", client.redirect_uri);
+            info!("redirect_uri: {redirect_uri}");
+            if client.redirect_uri == redirect_uri {
                 return Some(client.clone());
             }
+        } else {
+            error!("Invalid client_id: {client_id}");
         }
         None
     }
 
+    /// Create a new authorization session for the OAuth flow
+    /// Returns the session ID for tracking the auth process
     pub async fn create_auth_session(
         &self,
         client_id: String,
@@ -88,6 +128,8 @@ impl McpOAuthStore {
         session_id
     }
 
+    /// Update an authorization session with a generated token
+    /// Links the OAuth token to the session for later retrieval
     pub async fn update_auth_session_token(
         &self,
         session_id: &str,
@@ -102,6 +144,8 @@ impl McpOAuthStore {
         }
     }
 
+    /// Create a new MCP access token linked to an authorization session
+    /// Returns the generated McpAccessToken on success
     pub async fn create_mcp_token(&self, session_id: &str) -> Result<McpAccessToken, String> {
         let sessions = self.auth_sessions.read().await;
         if let Some(session) = sessions.get(session_id) {
@@ -132,12 +176,14 @@ impl McpOAuthStore {
         }
     }
 
+    /// Validate an access token and return the associated McpAccessToken if valid
     pub async fn validate_token(&self, token: &str) -> Option<McpAccessToken> {
         self.access_tokens.read().await.get(token).cloned()
     }
 }
 
-// a simple session record for auth session
+/// Authorization session data structure
+/// Tracks ongoing OAuth authorization flows with client and state information
 #[derive(Clone, Debug)]
 pub struct AuthSession {
     pub client_id: String,
@@ -147,7 +193,8 @@ pub struct AuthSession {
     pub auth_token: Option<AuthToken>,
 }
 
-// a simple token record for mcp token using oauth2 standard token
+/// MCP-specific access token structure
+/// Wraps OAuth2 standard tokens with additional MCP metadata
 #[derive(Clone, Debug, Serialize)]
 pub struct McpAccessToken {
     pub access_token: String,
@@ -159,6 +206,8 @@ pub struct McpAccessToken {
     pub client_id: String,
 }
 
+/// OAuth authorization request parameters
+/// Contains all required fields for initiating an OAuth authorization flow
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
     #[allow(dead_code)]
@@ -169,6 +218,8 @@ pub struct AuthorizeQuery {
     pub state: Option<String>,
 }
 
+/// OAuth token request parameters
+/// Used for exchanging authorization codes for access tokens
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TokenRequest {
     pub grant_type: String,
@@ -186,6 +237,8 @@ pub struct TokenRequest {
     pub refresh_token: String,
 }
 
+/// User information structure for OAuth responses
+/// Contains standard user profile data
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UserInfo {
     pub sub: String,
@@ -194,6 +247,8 @@ pub struct UserInfo {
     pub username: String,
 }
 
+/// Template context for OAuth authorization page
+/// Contains all data needed to render the authorization consent form
 #[derive(Template)]
 #[template(path = "mcp_oauth_authorize.html")]
 pub struct OAuthAuthorizeTemplate {
@@ -204,7 +259,8 @@ pub struct OAuthAuthorizeTemplate {
     pub scopes: String,
 }
 
-// handle approval of authorization
+/// Form data for user authorization approval
+/// Contains user's decision and associated OAuth parameters
 #[derive(Debug, Deserialize)]
 pub struct ApprovalForm {
     pub client_id: String,
@@ -214,6 +270,8 @@ pub struct ApprovalForm {
     pub approved: String,
 }
 
+/// Generate a cryptographically secure random string
+/// Used for creating client secrets and other security tokens
 pub fn generate_random_string(length: usize) -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -222,7 +280,8 @@ pub fn generate_random_string(length: usize) -> String {
         .collect()
 }
 
-// Initial OAuth authorize endpoint
+/// OAuth authorization endpoint handler
+/// Displays the authorization consent page to users
 pub async fn oauth_authorize(
     Query(params): Query<AuthorizeQuery>,
     State(state): State<Arc<McpOAuthStore>>,
@@ -256,6 +315,8 @@ pub async fn oauth_authorize(
     }
 }
 
+/// Handle user approval/rejection of OAuth authorization
+/// Processes the consent form and generates authorization codes
 pub async fn oauth_approve(
     State(state): State<Arc<McpOAuthStore>>,
     Form(form): Form<ApprovalForm>,
@@ -324,7 +385,8 @@ pub async fn oauth_approve(
     Redirect::to(&redirect_url).into_response()
 }
 
-// Handle token request from the MCP client
+/// OAuth token endpoint handler
+/// Exchanges authorization codes for access tokens
 pub async fn oauth_token(
     State(state): State<Arc<McpOAuthStore>>,
     request: axum::http::Request<Body>,
@@ -464,7 +526,8 @@ pub async fn oauth_token(
     }
 }
 
-// Auth middleware for StreamableHttp connections
+/// Authentication middleware for validating Bearer tokens
+/// Intercepts requests and validates access tokens before allowing access
 pub async fn validate_token_middleware(
     State(token_store): State<Arc<McpOAuthStore>>,
     request: Request<axum::body::Body>,
@@ -494,8 +557,31 @@ pub async fn validate_token_middleware(
     }
 }
 
-// handle oauth server metadata request
-pub async fn oauth_authorization_server(bind_address: &str) -> impl IntoResponse {
+/// Get the actual IP address to use for endpoints
+/// Returns the host from request headers if bind_address is 0.0.0.0, otherwise returns the original address
+fn get_endpoint_address(bind_address: &str, host_header: Option<&str>) -> String {
+    if bind_address.starts_with("0.0.0.0") {
+        if let Some(host) = host_header {
+            // Use the Host header value, which contains the actual IP/domain the client used
+            host.to_string()
+        } else {
+            // Fallback to localhost if no Host header is present
+            bind_address.replacen("0.0.0.0", "localhost", 1)
+        }
+    } else {
+        bind_address.to_string()
+    }
+}
+
+/// OAuth authorization server metadata endpoint
+/// Returns server capabilities and endpoint URLs per RFC 8414
+pub async fn oauth_authorization_server(
+    bind_address: &str,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let host_header = headers.get("host").and_then(|h| h.to_str().ok());
+    let endpoint_address = get_endpoint_address(bind_address, host_header);
+
     let mut additional_fields = HashMap::new();
     additional_fields.insert(
         "response_types_supported".into(),
@@ -506,19 +592,20 @@ pub async fn oauth_authorization_server(bind_address: &str) -> impl IntoResponse
         Value::Array(vec![Value::String("S256".into())]),
     );
     let metadata = AuthorizationMetadata {
-        authorization_endpoint: format!("http://{bind_address}/authorize"),
-        token_endpoint: format!("http://{bind_address}/token"),
+        authorization_endpoint: format!("http://{endpoint_address}/authorize"),
+        token_endpoint: format!("http://{endpoint_address}/token"),
         scopes_supported: Some(vec!["profile".to_string(), "email".to_string()]),
-        registration_endpoint: format!("http://{bind_address}/register"),
-        issuer: Some(format!("http://{bind_address}")),
-        jwks_uri: Some(format!("http://{bind_address}/jwks")),
+        registration_endpoint: format!("http://{endpoint_address}/register"),
+        issuer: Some(format!("http://{endpoint_address}")),
+        jwks_uri: Some(format!("http://{endpoint_address}/jwks")),
         additional_fields,
     };
     debug!("metadata: {:?}", metadata);
     (StatusCode::OK, Json(metadata))
 }
 
-// handle client registration request
+/// Dynamic client registration endpoint
+/// Allows clients to register themselves with the OAuth server
 pub async fn oauth_register(
     State(state): State<Arc<McpOAuthStore>>,
     Json(req): Json<ClientRegistrationRequest>,
@@ -562,4 +649,384 @@ pub async fn oauth_register(
     };
 
     (StatusCode::CREATED, Json(response)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_oauth_store() -> McpOAuthStore {
+        McpOAuthStore::new()
+    }
+
+    #[tokio::test]
+    async fn test_oauth_store_creation() {
+        let store = create_test_oauth_store();
+
+        // Check that default client exists
+        let clients = store.clients.read().await;
+        assert!(clients.contains_key("mcp-client"));
+
+        let default_client = clients.get("mcp-client").unwrap();
+        assert_eq!(default_client.client_id, "mcp-client");
+        assert_eq!(
+            default_client.client_secret,
+            Some("mcp-client-secret".to_string())
+        );
+        assert!(default_client.scopes.contains(&"profile".to_string()));
+        assert!(default_client.scopes.contains(&"email".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_validate_client_success() {
+        let store = create_test_oauth_store();
+
+        let result = store
+            .validate_client("mcp-client", "http://localhost:8080/callback")
+            .await;
+        assert!(result.is_some());
+
+        let client = result.unwrap();
+        assert_eq!(client.client_id, "mcp-client");
+    }
+
+    #[tokio::test]
+    async fn test_validate_client_invalid_client_id() {
+        let store = create_test_oauth_store();
+
+        let result = store
+            .validate_client("invalid-client", "http://localhost:8080/callback")
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_validate_client_invalid_redirect_uri() {
+        let store = create_test_oauth_store();
+
+        let result = store
+            .validate_client("mcp-client", "http://malicious.com/callback")
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_auth_session() {
+        let store = create_test_oauth_store();
+
+        let session_id = store
+            .create_auth_session(
+                "mcp-client".to_string(),
+                Some("profile email".to_string()),
+                Some("state123".to_string()),
+                "session123".to_string(),
+            )
+            .await;
+
+        assert_eq!(session_id, "session123");
+
+        // Verify session exists
+        let sessions = store.auth_sessions.read().await;
+        assert!(sessions.contains_key("session123"));
+
+        let session = sessions.get("session123").unwrap();
+        assert_eq!(session.client_id, "mcp-client");
+        assert_eq!(session.scope, Some("profile email".to_string()));
+        assert!(session.auth_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_auth_session_token() {
+        let store = create_test_oauth_store();
+
+        // Create session first
+        let session_id = store
+            .create_auth_session(
+                "mcp-client".to_string(),
+                Some("profile".to_string()),
+                None,
+                "session456".to_string(),
+            )
+            .await;
+
+        // Create a mock token
+        let token = AuthToken::new(
+            AccessToken::new("access_token_123".to_string()),
+            oauth2::basic::BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+
+        // Update session with token
+        let result = store.update_auth_session_token(&session_id, token).await;
+        assert!(result.is_ok());
+
+        // Verify token was added
+        let sessions = store.auth_sessions.read().await;
+        let session = sessions.get("session456").unwrap();
+        assert!(session.auth_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_auth_session_token_invalid_session() {
+        let store = create_test_oauth_store();
+
+        let token = AuthToken::new(
+            AccessToken::new("access_token_123".to_string()),
+            oauth2::basic::BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+
+        let result = store.update_auth_session_token("nonexistent", token).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Session not found");
+    }
+
+    #[tokio::test]
+    async fn test_create_mcp_token_success() {
+        let store = create_test_oauth_store();
+
+        // Create session and update with auth token
+        let session_id = store
+            .create_auth_session(
+                "mcp-client".to_string(),
+                Some("profile".to_string()),
+                None,
+                "session789".to_string(),
+            )
+            .await;
+
+        let auth_token = AuthToken::new(
+            AccessToken::new("third_party_token".to_string()),
+            oauth2::basic::BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+
+        store
+            .update_auth_session_token(&session_id, auth_token)
+            .await
+            .unwrap();
+
+        // Create MCP token
+        let result = store.create_mcp_token(&session_id).await;
+        assert!(result.is_ok());
+
+        let mcp_token = result.unwrap();
+        assert!(mcp_token.access_token.starts_with("mcp-token-"));
+        assert!(
+            mcp_token
+                .refresh_token
+                .as_ref()
+                .unwrap()
+                .starts_with("mcp-refresh-")
+        );
+        assert_eq!(mcp_token.token_type, "bearer");
+        assert_eq!(mcp_token.expires_in, Some(3600));
+        assert_eq!(mcp_token.scope, Some("profile".to_string()));
+        assert_eq!(mcp_token.client_id, "mcp-client");
+    }
+
+    #[tokio::test]
+    async fn test_create_mcp_token_no_session() {
+        let store = create_test_oauth_store();
+
+        let result = store.create_mcp_token("nonexistent").await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Session not found");
+    }
+
+    #[tokio::test]
+    async fn test_create_mcp_token_no_auth_token() {
+        let store = create_test_oauth_store();
+
+        // Create session without auth token
+        let session_id = store
+            .create_auth_session(
+                "mcp-client".to_string(),
+                Some("profile".to_string()),
+                None,
+                "session_no_token".to_string(),
+            )
+            .await;
+
+        let result = store.create_mcp_token(&session_id).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "No third-party token available for session"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_token_success() {
+        let store = create_test_oauth_store();
+
+        // Create a complete flow to get a valid token
+        let session_id = store
+            .create_auth_session(
+                "mcp-client".to_string(),
+                Some("profile".to_string()),
+                None,
+                "token_test_session".to_string(),
+            )
+            .await;
+
+        let auth_token = AuthToken::new(
+            AccessToken::new("third_party_token".to_string()),
+            oauth2::basic::BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+
+        store
+            .update_auth_session_token(&session_id, auth_token)
+            .await
+            .unwrap();
+        let mcp_token = store.create_mcp_token(&session_id).await.unwrap();
+
+        // Validate the token
+        let result = store.validate_token(&mcp_token.access_token).await;
+        assert!(result.is_some());
+
+        let validated_token = result.unwrap();
+        assert_eq!(validated_token.access_token, mcp_token.access_token);
+        assert_eq!(validated_token.client_id, "mcp-client");
+    }
+
+    #[tokio::test]
+    async fn test_validate_token_invalid() {
+        let store = create_test_oauth_store();
+
+        let result = store.validate_token("invalid_token").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_access_token_serialization() {
+        let auth_token = AuthToken::new(
+            AccessToken::new("test_token".to_string()),
+            oauth2::basic::BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+
+        let mcp_token = McpAccessToken {
+            access_token: "mcp-token-123".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: Some(3600),
+            refresh_token: Some("mcp-refresh-123".to_string()),
+            scope: Some("profile email".to_string()),
+            auth_token,
+            client_id: "test-client".to_string(),
+        };
+
+        // Test that it can be serialized to JSON
+        let json_result = serde_json::to_string(&mcp_token);
+        assert!(json_result.is_ok());
+
+        let json_str = json_result.unwrap();
+        assert!(json_str.contains("mcp-token-123"));
+        assert!(json_str.contains("bearer"));
+        assert!(json_str.contains("3600"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_session_creation_with_minimal_data() {
+        let store = create_test_oauth_store();
+
+        let session_id = store
+            .create_auth_session(
+                "test-client".to_string(),
+                None, // No scope
+                None, // No state
+                "minimal_session".to_string(),
+            )
+            .await;
+
+        assert_eq!(session_id, "minimal_session");
+
+        let sessions = store.auth_sessions.read().await;
+        let session = sessions.get("minimal_session").unwrap();
+        assert_eq!(session.client_id, "test-client");
+        assert!(session.scope.is_none());
+        assert!(session._state.is_none());
+        assert!(session.auth_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_access() {
+        let store = Arc::new(create_test_oauth_store());
+
+        // Test concurrent session creation
+        let mut handles = vec![];
+        for i in 0..10 {
+            let store_clone = store.clone();
+            let handle = tokio::spawn(async move {
+                store_clone
+                    .create_auth_session(
+                        "mcp-client".to_string(),
+                        Some("profile".to_string()),
+                        None,
+                        format!("concurrent_session_{i}"),
+                    )
+                    .await
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let session_id = handle.await.unwrap();
+            assert!(session_id.starts_with("concurrent_session_"));
+        }
+
+        // Verify all sessions were created
+        let sessions = store.auth_sessions.read().await;
+        assert_eq!(sessions.len(), 10);
+    }
+    #[test]
+    fn test_get_endpoint_address_with_zero_ip() {
+        let result = get_endpoint_address("0.0.0.0:8080", Some("192.168.1.100:8080"));
+        assert_eq!(result, "192.168.1.100:8080");
+    }
+
+    #[test]
+    fn test_get_endpoint_address_with_zero_ip_no_port() {
+        let result = get_endpoint_address("0.0.0.0", Some("192.168.1.100"));
+        assert_eq!(result, "192.168.1.100");
+    }
+
+    #[test]
+    fn test_get_endpoint_address_with_zero_ip_no_host_header() {
+        let result = get_endpoint_address("0.0.0.0:8080", None);
+        assert_eq!(result, "localhost:8080");
+    }
+
+    #[test]
+    fn test_get_endpoint_address_with_specific_ip() {
+        let result = get_endpoint_address("192.168.1.100:8080", Some("192.168.1.100:8080"));
+        assert_eq!(result, "192.168.1.100:8080");
+    }
+
+    #[test]
+    fn test_get_endpoint_address_with_localhost() {
+        let result = get_endpoint_address("localhost:8080", Some("localhost:8080"));
+        assert_eq!(result, "localhost:8080");
+    }
+
+    #[test]
+    fn test_get_endpoint_address_with_domain() {
+        let result = get_endpoint_address("example.com:8080", Some("example.com:8080"));
+        assert_eq!(result, "example.com:8080");
+    }
+
+    #[tokio::test]
+    async fn test_oauth_authorization_server_with_zero_ip() {
+        use axum::http::HeaderMap;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "192.168.1.100:8080".parse().unwrap());
+
+        let _response = oauth_authorization_server("0.0.0.0:8080", headers).await;
+
+        // This is a basic test to ensure the function doesn't panic
+        // In a real test, you'd want to extract and verify the JSON response
+        // to ensure the URLs contain "192.168.1.100:8080" instead of "0.0.0.0:8080"
+    }
 }
