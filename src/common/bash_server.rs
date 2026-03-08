@@ -47,8 +47,8 @@ use std::{
     env,
     fs::{self, File},
     io::Write,
-    process::Command,
 };
+use tokio::process::Command;
 use tracing::error;
 use tracing::info;
 use uuid::Uuid;
@@ -123,8 +123,9 @@ pub trait CommandRunner {
     /// Convert a Command instance to a readable string representation
     /// Handles proper quoting of arguments containing spaces
     fn stringify_command(cmd: &Command) -> String {
-        let program = cmd.get_program().to_string_lossy();
-        let args = cmd
+        let std_cmd = cmd.as_std();
+        let program = std_cmd.get_program().to_string_lossy();
+        let args = std_cmd
             .get_args()
             .map(|arg| {
                 let s = arg.to_string_lossy();
@@ -147,26 +148,19 @@ pub trait CommandRunner {
         mut cmd: Command,
     ) -> Result<Output, ErrorData> {
         let cmd_str = Self::stringify_command(&cmd);
-        // Execute command with timeout
-        let output = tokio::time::timeout(timeout, async {
-            tokio::task::spawn_blocking(move || cmd.output()).await
-        })
-        .await
-        .map_err(|_| ErrorData {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::Owned("Command execution timed out".to_string()),
-            data: None,
-        })?
-        .map_err(|e| ErrorData {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::Owned(format!("Failed to spawn command: {e}")),
-            data: None,
-        })?
-        .map_err(|e| ErrorData {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: Cow::Owned(format!("Command execution failed: {e}")),
-            data: None,
-        })?;
+        // Execute command with timeout using tokio's async process
+        let output = tokio::time::timeout(timeout, cmd.output())
+            .await
+            .map_err(|_| ErrorData {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::Owned("Command execution timed out".to_string()),
+                data: None,
+            })?
+            .map_err(|e| ErrorData {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::Owned(format!("Command execution failed: {e}")),
+                data: None,
+            })?;
 
         // log execution of command
         info!("Execute command: {cmd_str}");
@@ -270,16 +264,24 @@ impl BashServer {
             std::time::Duration::from_secs(request.timeout_seconds.unwrap_or(30));
 
         // Try to find Python executable on Windows
-        // First try 'python', then 'python3', then 'py'
-        let python_commands = ["python", "python3", "py"];
+        // Prefer 'py' (Windows Python Launcher) over 'python'/'python3'
+        // to avoid Windows Store stub which may appear to succeed but isn't a real interpreter
+        let python_commands = ["py", "python3", "python"];
         let mut cmd = None;
 
         for python_cmd in &python_commands {
-            if let Ok(output) = std::process::Command::new(python_cmd)
+            if let Ok(output) = Command::new(python_cmd)
                 .arg("--version")
                 .output()
+                .await
             {
-                if output.status.success() {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                // Verify output contains "Python" to avoid Windows Store stub
+                if output.status.success() && combined.contains("Python") {
                     cmd = Some(Command::new(python_cmd));
                     break;
                 }
@@ -393,7 +395,7 @@ impl BashServer {
     /// Combines multiple shell commands to collect comprehensive CPU data
     fn build_cpu_info_command() -> String {
         let cpu_commands = [
-            r#"LANG=C lscpu | awk -F: '$1=="Model name" {print $2}'"#, // CPU model
+            r#"LANG=C lscpu | awk -F: '$1==\"Model name\" {print $2}'"#, // CPU model
             r#"awk '/processor/{core++} END{print core}' /proc/cpuinfo"#, // Core count
             r#"uptime | sed 's/,/ /g' | awk '{for(i=NF-2;i<=NF;i++)print $i }' | xargs"#, // Load averages
             r#"vmstat 1 1 | awk 'NR==3{print $11}'"#, // Interrupts
@@ -407,18 +409,9 @@ impl BashServer {
     /// Build system information gathering command
     /// Collects kernel version, hostname, and uptime in structured format
     fn build_system_info_command() -> String {
-        let system_commands = [
-            "uname -r",                                           // Kernel version
-            "hostname",                                           // Hostname
-            r#"uptime | awk -F "," '{print $1}' | sed "s/ //g""#, // Uptime (first part)
-        ];
-
-        let combined_command = format!(
-            "({}) | sed \":a;N;s/\\n/^/g;ta\" | awk -F \"^\" 'BEGIN{{print \"version hostname uptime\"}} {{print $1, $2, $3}}'",
-            system_commands.join(" ; ")
-        );
-
-        format!(r#"bash -c '{combined_command}'"#)
+        // Use single quotes for bash -c to avoid double quote escaping issues
+        // Use '"'"' trick to include single quotes within single-quoted strings
+        r#"bash -c '(uname -r ; hostname ; uptime | awk -F "," '"'"'{print $1}'"'"' | sed "s/ //g") | sed ":a;N;s/\\n/^/g;ta" | awk -F "^" '"'"'BEGIN{print "version hostname uptime"} {print $1, $2, $3}'"'"''"#.to_string()
     }
 
     /// Build top CPU processes gathering command
@@ -427,7 +420,7 @@ impl BashServer {
         let process_commands = [
             "ps aux",     // Get all processes
             "sort -k3nr", // Sort by CPU usage (descending)
-            r#"awk 'BEGIN{ print "pid cpu_usage mem_usage command" } {printf "%s %s %s ", $2, $3, $4; for (i=11; i<=NF; i++) { printf "%s", $i; if (i < NF) printf " "; } print ""}'"#, // Format output
+            r#"awk 'BEGIN{ print \"pid cpu_usage mem_usage command\" } {printf \"%s %s %s \", $2, $3, $4; for (i=11; i<=NF; i++) { printf \"%s\", $i; if (i < NF) printf \" \" } print \"\"}'"#, // Format output
             "head -n 11", // Get top 10 + header
         ];
 
@@ -440,7 +433,7 @@ impl BashServer {
         let process_commands = [
             "ps aux",     // Get all processes
             "sort -k4nr", // Sort by memory usage (descending)
-            r#"awk 'BEGIN{ print "pid cpu_usage mem_usage command" } {printf "%s %s %s ", $2, $3, $4; for (i=11; i<=NF; i++) { printf "%s", $i; if (i < NF) printf " "; } print ""}'"#, // Format output
+            r#"awk 'BEGIN{ print \"pid cpu_usage mem_usage command\" } {printf \"%s %s %s \", $2, $3, $4; for (i=11; i<=NF; i++) { printf \"%s\", $i; if (i < NF) printf \" \" } print \"\"}'"#, // Format output
             "head -n 11", // Get top 10 + header
         ];
 
